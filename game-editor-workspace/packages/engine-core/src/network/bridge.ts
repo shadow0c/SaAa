@@ -126,4 +126,4 @@ export class EditorGameBridge {
   onSceneRequest(handler: () => void) {
     return this.on('scene:request', () => handler());
   }
-                   }
+}
