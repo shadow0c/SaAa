@@ -1,0 +1,13 @@
+{
+  "name": "game-editor-workspace",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:engine": "npm run build --workspace=@game-engine/core",
+    "dev:editor": "npm run dev --workspace=editor-app",
+    "dev:bridge": "npm run start --workspace=bridge-server",
+    "dev": "npm run build:engine && (npm run dev:bridge & npm run dev:editor)"
+  }
+}
