@@ -9,9 +9,23 @@
 // Physics + Render + Assets + Network API'lerini TEK bir yerde birleştirir;
 // hem editör hem de oyun aynı `Engine` örneğini (veya ikisi ayrı örnek
 // yaratıp yalnızca `serialize()`/`deserialize()` ile veri paylaşarak) kullanabilir.
+//
+// [BU TURDA DÜZELTİLEN 2 GERÇEK HATA - physics/index.ts refaktörüyle birlikte]
+// 1. [MEMORY LEAK] `removeEntity()` collider'ı ASLA `physics.removeCollider()` ile
+//    kaldırmıyordu — silinen bir nesnenin collider'ı sonsuza kadar Octree'de ve
+//    `colliders[]` dizisinde YAŞAMAYA devam ediyordu (hem bellek sızıntısı hem de
+//    "silinen görünmez bir duvara çarpma" mantık hatası). Düzeltildi.
+// 2. [LOGIC ERROR] `updateTransform()` bir BoxCollider'ın `min`/`max`'ını DOĞRUDAN
+//    `.copy()` ile mutasyona uğratıyordu. physics/index.ts artık bir Octree
+//    kullandığından, bu doğrudan mutasyon Octree'nin uzamsal indeksini BOZAR
+//    (collider yanlış oktant'ta aranır, çarpışma testleri sessizce yanlış negatif
+//    dönebilir). Artık `physics.updateColliderBounds()` üzerinden geçiyor.
 
 import * as THREE from 'three';
-import { PhysicsEngine, type BoxCollider } from '../physics/index.js';
+import {
+  PhysicsEngine, type Collider, type BoxCollider,
+  type CharacterController, type CharacterControllerConfig,
+} from '../physics/index.js';
 import { RenderEngine } from '../render/index.js';
 import { AssetAPI } from '../assets/index.js';
 
@@ -20,6 +34,8 @@ export interface EntityTransform {
   rotationY: number; // derece - motor şu an yalnızca Y ekseni rotasyonunu birinci sınıf destekler
   scale: { x: number; y: number; z: number };
 }
+
+export type ColliderType = 'box' | 'sphere' | 'capsule' | 'none';
 
 export interface EngineEntity {
   id: string;
@@ -61,7 +77,9 @@ export class Engine {
   public readonly assets: AssetAPI;
 
   private entities = new Map<string, EngineEntity>();
-  private colliderByEntity = new Map<string, BoxCollider>();
+  private colliderByEntity = new Map<string, Collider>();
+  private colliderTypeByEntity = new Map<string, ColliderType>();
+  private controllerByEntity = new Map<string, CharacterController>();
   private factories = new Map<string, EntityFactory>();
 
   constructor(gravity = 9.81) {
@@ -93,12 +111,9 @@ export class Engine {
     const entity: EngineEntity = { id, name, transform: { ...transform }, object3D, userData: { ...userData, __kind: kind } };
 
     if (solidCollider) {
-      const box = new THREE.Box3().setFromObject(object3D);
-      const collider = this.physics.addStaticCollider(
-        { x: box.min.x, y: box.min.y, z: box.min.z },
-        { x: box.max.x, y: box.max.y, z: box.max.z },
-      );
+      const collider = this.physics.addStaticCollider(...this.worldAABBOf(object3D));
       this.colliderByEntity.set(id, collider);
+      this.colliderTypeByEntity.set(id, 'box');
       entity.colliderId = id;
     }
 
@@ -114,6 +129,14 @@ export class Engine {
     return [...this.entities.values()];
   }
 
+  private worldAABBOf(object3D: THREE.Object3D): [{ x: number; y: number; z: number }, { x: number; y: number; z: number }] {
+    const box = new THREE.Box3().setFromObject(object3D);
+    return [
+      { x: box.min.x, y: box.min.y, z: box.min.z },
+      { x: box.max.x, y: box.max.y, z: box.max.z },
+    ];
+  }
+
   updateTransform(id: string, transform: Partial<EntityTransform>) {
     const entity = this.entities.get(id);
     if (!entity) return;
@@ -124,11 +147,100 @@ export class Engine {
     object3D.scale.set(entity.transform.scale.x, entity.transform.scale.y, entity.transform.scale.z);
 
     const collider = this.colliderByEntity.get(id);
-    if (collider) {
+    const colliderType = this.colliderTypeByEntity.get(id);
+    if (collider && colliderType === 'box') {
+      // [FIX] Doğrudan `.copy()` YERİNE `updateColliderBounds` — Octree'yi de günceller.
+      const [min, max] = this.worldAABBOf(object3D);
+      this.physics.updateColliderBounds(collider as BoxCollider, min, max);
+    } else if (collider && colliderType === 'sphere') {
       const box = new THREE.Box3().setFromObject(object3D);
-      collider.min.copy(box.min);
-      collider.max.copy(box.max);
+      const center = box.getCenter(new THREE.Vector3());
+      const radius = box.getSize(new THREE.Vector3()).length() / 2;
+      this.physics.updateSphereCollider(collider as import('../physics/index.js').SphereCollider, center, radius);
+    } else if (collider && colliderType === 'capsule') {
+      const box = new THREE.Box3().setFromObject(object3D);
+      const size = box.getSize(new THREE.Vector3());
+      const radius = Math.max(size.x, size.z) / 2;
+      const height = Math.max(0.01, size.y - radius * 2);
+      this.physics.updateCapsuleCollider(
+        collider as import('../physics/index.js').CapsuleCollider,
+        { x: box.min.x + radius, y: box.min.y, z: box.min.z + radius }, height, radius,
+      );
     }
+  }
+
+  /**
+   * YENİ: Inspector'daki "Collider Type Seçimi" (Box/Sphere/Capsule) buradan
+   * beslenir. Mevcut collider'ı (varsa, tipi ne olursa olsun) kaldırır ve
+   * entity'nin GÜNCEL dünya-uzayı sınırlayıcı kutusundan türetilmiş yeni tipte
+   * bir collider ekler.
+   */
+  setEntityColliderType(id: string, type: ColliderType): Collider | null {
+    const entity = this.entities.get(id);
+    if (!entity) return null;
+
+    const existing = this.colliderByEntity.get(id);
+    if (existing) {
+      this.physics.removeCollider(existing);
+      this.colliderByEntity.delete(id);
+      this.colliderTypeByEntity.delete(id);
+    }
+
+    if (type === 'none') return null;
+
+    const box = new THREE.Box3().setFromObject(entity.object3D);
+    let collider: Collider;
+    if (type === 'box') {
+      const [min, max] = this.worldAABBOf(entity.object3D);
+      collider = this.physics.addStaticCollider(min, max);
+    } else if (type === 'sphere') {
+      const center = box.getCenter(new THREE.Vector3());
+      const radius = box.getSize(new THREE.Vector3()).length() / 2;
+      collider = this.physics.addSphereCollider(center, radius);
+    } else {
+      const size = box.getSize(new THREE.Vector3());
+      const radius = Math.max(size.x, size.z) / 2;
+      const height = Math.max(0.01, size.y - radius * 2);
+      collider = this.physics.addCapsuleCollider({ x: box.min.x + radius, y: box.min.y, z: box.min.z + radius }, height, radius);
+    }
+
+    this.colliderByEntity.set(id, collider);
+    this.colliderTypeByEntity.set(id, type);
+    entity.colliderId = id;
+    return collider;
+  }
+
+  getColliderForEntity(id: string): Collider | undefined {
+    return this.colliderByEntity.get(id);
+  }
+
+  getColliderTypeForEntity(id: string): ColliderType {
+    return this.colliderTypeByEntity.get(id) ?? 'none';
+  }
+
+  // ------------------------- Character Controller kaydı -------------------------
+  // Inspector'daki "Rigidbody/Config Verileri" (mass/radius/height/maxForce/friction)
+  // bir entity'ye BAĞLI bir CharacterController örneğini canlı besler.
+
+  attachCharacterController(id: string, config: CharacterControllerConfig): CharacterController {
+    const existing = this.controllerByEntity.get(id);
+    if (existing) return existing;
+    const controller = this.physics.createCharacterController(config);
+    this.controllerByEntity.set(id, controller);
+    return controller;
+  }
+
+  getCharacterController(id: string): CharacterController | undefined {
+    return this.controllerByEntity.get(id);
+  }
+
+  /** Inspector'daki sayısal alanlar değiştikçe çağrılır - CharacterController.setConfig'e iletir. */
+  updateCharacterControllerConfig(id: string, patch: Partial<CharacterControllerConfig>) {
+    this.controllerByEntity.get(id)?.setConfig(patch);
+  }
+
+  detachCharacterController(id: string) {
+    this.controllerByEntity.delete(id);
   }
 
   removeEntity(id: string) {
@@ -143,7 +255,16 @@ export class Engine {
         for (const m of mats) m?.dispose();
       }
     });
+
+    // [FIX - MEMORY LEAK] Collider'ı fiziksel dünyadan da kaldır - önceki
+    // sürümde bu satır YOKTU, silinen nesnelerin collider'ları sonsuza kadar
+    // Octree'de kalıp "hayalet duvar" oluşturuyordu.
+    const collider = this.colliderByEntity.get(id);
+    if (collider) this.physics.removeCollider(collider);
     this.colliderByEntity.delete(id);
+    this.colliderTypeByEntity.delete(id);
+    this.controllerByEntity.delete(id);
+
     this.entities.delete(id);
   }
 
