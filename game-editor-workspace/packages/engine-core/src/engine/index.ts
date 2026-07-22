@@ -9,33 +9,18 @@
 // Physics + Render + Assets + Network API'lerini TEK bir yerde birleştirir;
 // hem editör hem de oyun aynı `Engine` örneğini (veya ikisi ayrı örnek
 // yaratıp yalnızca `serialize()`/`deserialize()` ile veri paylaşarak) kullanabilir.
-//
-// [BU TURDA DÜZELTİLEN 2 GERÇEK HATA - physics/index.ts refaktörüyle birlikte]
-// 1. [MEMORY LEAK] `removeEntity()` collider'ı ASLA `physics.removeCollider()` ile
-//    kaldırmıyordu — silinen bir nesnenin collider'ı sonsuza kadar Octree'de ve
-//    `colliders[]` dizisinde YAŞAMAYA devam ediyordu (hem bellek sızıntısı hem de
-//    "silinen görünmez bir duvara çarpma" mantık hatası). Düzeltildi.
-// 2. [LOGIC ERROR] `updateTransform()` bir BoxCollider'ın `min`/`max`'ını DOĞRUDAN
-//    `.copy()` ile mutasyona uğratıyordu. physics/index.ts artık bir Octree
-//    kullandığından, bu doğrudan mutasyon Octree'nin uzamsal indeksini BOZAR
-//    (collider yanlış oktant'ta aranır, çarpışma testleri sessizce yanlış negatif
-//    dönebilir). Artık `physics.updateColliderBounds()` üzerinden geçiyor.
 
 import * as THREE from 'three';
-import {
-  PhysicsEngine, type Collider, type BoxCollider,
-  type CharacterController, type CharacterControllerConfig,
-} from '../physics/index.js';
+import { PhysicsEngine, type BoxCollider } from '../physics/index.js';
 import { RenderEngine } from '../render/index.js';
 import { AssetAPI } from '../assets/index.js';
+import type { ComponentTypeDefinition, EngineComponent } from '../components/index.js';
 
 export interface EntityTransform {
   position: { x: number; y: number; z: number };
   rotationY: number; // derece - motor şu an yalnızca Y ekseni rotasyonunu birinci sınıf destekler
   scale: { x: number; y: number; z: number };
 }
-
-export type ColliderType = 'box' | 'sphere' | 'capsule' | 'none';
 
 export interface EngineEntity {
   id: string;
@@ -45,6 +30,8 @@ export interface EngineEntity {
   colliderId?: string;
   /** OYUNA ÖZGÜ tüm veri burada yaşar (takım, silah, can, custom flag'ler...). Motor bunun içeriğini bilmez. */
   userData: Record<string, unknown>;
+  /** Unity/Godot tarzı takılabilir component'ler (CameraSystem3D, Box3D, ...). */
+  components: EngineComponent[];
 }
 
 export interface SerializedEntity {
@@ -52,6 +39,10 @@ export interface SerializedEntity {
   name: string;
   transform: EntityTransform;
   userData: Record<string, unknown>;
+  /** entity.colliderId !== undefined mi — genel (oyun-bağımsız) bir bayrak, `userData` içindeki
+   *  herhangi bir oyuna-özgü isimlendirmeye (ör. 'solid') bağımlı DEĞİLDİR. */
+  hasCollider: boolean;
+  components: EngineComponent[];
 }
 
 export interface SerializedScene {
@@ -61,6 +52,17 @@ export interface SerializedScene {
 }
 
 export type EntityFactory = (transform: EntityTransform, userData: Record<string, unknown>) => THREE.Object3D;
+
+export interface EngineOptions {
+  gravity?: number;
+  /**
+   * true ise component'lerin editör-içi görsel gizmoları (ör. Box3D'nin tel-
+   * kafes kutusu) sahneye eklenir. Oyunun kendisi bunu FALSE bırakmalı —
+   * oyuncunun tel-kafes çarpışma kutuları görmesini istemezsin. Editör
+   * bunu TRUE bırakır (varsayılan).
+   */
+  debugVisuals?: boolean;
+}
 
 /**
  * Genel amaçlı motor çekirdeği.
@@ -75,23 +77,80 @@ export class Engine {
   public readonly physics: PhysicsEngine;
   public readonly render: RenderEngine;
   public readonly assets: AssetAPI;
+  public readonly debugVisuals: boolean;
 
   private entities = new Map<string, EngineEntity>();
-  private colliderByEntity = new Map<string, Collider>();
-  private colliderTypeByEntity = new Map<string, ColliderType>();
-  private controllerByEntity = new Map<string, CharacterController>();
+  private colliderByEntity = new Map<string, BoxCollider>();
   private factories = new Map<string, EntityFactory>();
+  private componentTypes = new Map<string, ComponentTypeDefinition<any>>();
 
-  constructor(gravity = 9.81) {
+  constructor(gravity = 9.81, options: EngineOptions = {}) {
     this.scene = new THREE.Scene();
-    this.physics = new PhysicsEngine(gravity);
+    this.physics = new PhysicsEngine(options.gravity ?? gravity);
     this.render = new RenderEngine();
     this.assets = new AssetAPI();
+    this.debugVisuals = options.debugVisuals ?? true;
   }
 
   /** Oyuna/editöre özgü bir "entity türü" tanımla (ör. 'wall', 'spawnPoint', 'npc', 'coin'...). */
   registerEntityKind(kind: string, factory: EntityFactory) {
     this.factories.set(kind, factory);
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  //  Component sistemi (Unity/Godot tarzı — bkz. components/index.ts)
+  // ────────────────────────────────────────────────────────────────────
+
+  /** Yeni bir component TÜRÜ tanımla (ör. CameraSystem3DComponent, Box3DComponent). */
+  registerComponentType(def: ComponentTypeDefinition<any>): void {
+    this.componentTypes.set(def.typeId, def);
+  }
+
+  getComponentTypeDefs(): ComponentTypeDefinition<any>[] {
+    return [...this.componentTypes.values()];
+  }
+
+  getComponentTypeDef(typeId: string): ComponentTypeDefinition<any> | undefined {
+    return this.componentTypes.get(typeId);
+  }
+
+  /** Bir entity'ye component ekler (o türden zaten varsa hiçbir şey yapmaz — entity başına tür başına TEK instance). */
+  addComponent(entityId: string, typeId: string): EngineComponent | undefined {
+    const entity = this.entities.get(entityId);
+    const def = this.componentTypes.get(typeId);
+    if (!entity || !def) return undefined;
+    if (entity.components.some((c) => c.typeId === typeId)) {
+      return entity.components.find((c) => c.typeId === typeId);
+    }
+    const component: EngineComponent = { typeId, data: def.defaultData() };
+    entity.components.push(component);
+    def.onSync(entity, component.data, this);
+    return component;
+  }
+
+  removeComponent(entityId: string, typeId: string): void {
+    const entity = this.entities.get(entityId);
+    if (!entity) return;
+    const idx = entity.components.findIndex((c) => c.typeId === typeId);
+    if (idx < 0) return;
+    const [component] = entity.components.splice(idx, 1);
+    const def = this.componentTypes.get(typeId);
+    def?.onDetach?.(entity, component.data, this);
+  }
+
+  /** Bir component'in verisini kısmen günceller ve `onSync`'i yeniden çalıştırır (idempotent). */
+  updateComponentData(entityId: string, typeId: string, patch: Record<string, unknown>): void {
+    const entity = this.entities.get(entityId);
+    if (!entity) return;
+    const component = entity.components.find((c) => c.typeId === typeId);
+    const def = this.componentTypes.get(typeId);
+    if (!component || !def) return;
+    Object.assign(component.data, patch);
+    def.onSync(entity, component.data, this);
+  }
+
+  getEntityComponents(entityId: string): EngineComponent[] {
+    return this.entities.get(entityId)?.components ?? [];
   }
 
   createEntity(kind: string, name: string, transform: EntityTransform, userData: Record<string, unknown> = {}, solidCollider = false): EngineEntity {
@@ -108,12 +167,19 @@ export class Engine {
     object3D.userData.__engineEntityId = id;
     this.scene.add(object3D);
 
-    const entity: EngineEntity = { id, name, transform: { ...transform }, object3D, userData: { ...userData, __kind: kind } };
+    const entity: EngineEntity = {
+      id, name, transform: { ...transform }, object3D,
+      userData: { ...userData, __kind: kind },
+      components: [],
+    };
 
     if (solidCollider) {
-      const collider = this.physics.addStaticCollider(...this.worldAABBOf(object3D));
+      const box = new THREE.Box3().setFromObject(object3D);
+      const collider = this.physics.addStaticCollider(
+        { x: box.min.x, y: box.min.y, z: box.min.z },
+        { x: box.max.x, y: box.max.y, z: box.max.z },
+      );
       this.colliderByEntity.set(id, collider);
-      this.colliderTypeByEntity.set(id, 'box');
       entity.colliderId = id;
     }
 
@@ -129,14 +195,6 @@ export class Engine {
     return [...this.entities.values()];
   }
 
-  private worldAABBOf(object3D: THREE.Object3D): [{ x: number; y: number; z: number }, { x: number; y: number; z: number }] {
-    const box = new THREE.Box3().setFromObject(object3D);
-    return [
-      { x: box.min.x, y: box.min.y, z: box.min.z },
-      { x: box.max.x, y: box.max.y, z: box.max.z },
-    ];
-  }
-
   updateTransform(id: string, transform: Partial<EntityTransform>) {
     const entity = this.entities.get(id);
     if (!entity) return;
@@ -147,105 +205,34 @@ export class Engine {
     object3D.scale.set(entity.transform.scale.x, entity.transform.scale.y, entity.transform.scale.z);
 
     const collider = this.colliderByEntity.get(id);
-    const colliderType = this.colliderTypeByEntity.get(id);
-    if (collider && colliderType === 'box') {
-      // [FIX] Doğrudan `.copy()` YERİNE `updateColliderBounds` — Octree'yi de günceller.
-      const [min, max] = this.worldAABBOf(object3D);
-      this.physics.updateColliderBounds(collider as BoxCollider, min, max);
-    } else if (collider && colliderType === 'sphere') {
+    if (collider) {
       const box = new THREE.Box3().setFromObject(object3D);
-      const center = box.getCenter(new THREE.Vector3());
-      const radius = box.getSize(new THREE.Vector3()).length() / 2;
-      this.physics.updateSphereCollider(collider as import('../physics/index.js').SphereCollider, center, radius);
-    } else if (collider && colliderType === 'capsule') {
-      const box = new THREE.Box3().setFromObject(object3D);
-      const size = box.getSize(new THREE.Vector3());
-      const radius = Math.max(size.x, size.z) / 2;
-      const height = Math.max(0.01, size.y - radius * 2);
-      this.physics.updateCapsuleCollider(
-        collider as import('../physics/index.js').CapsuleCollider,
-        { x: box.min.x + radius, y: box.min.y, z: box.min.z + radius }, height, radius,
-      );
-    }
-  }
-
-  /**
-   * YENİ: Inspector'daki "Collider Type Seçimi" (Box/Sphere/Capsule) buradan
-   * beslenir. Mevcut collider'ı (varsa, tipi ne olursa olsun) kaldırır ve
-   * entity'nin GÜNCEL dünya-uzayı sınırlayıcı kutusundan türetilmiş yeni tipte
-   * bir collider ekler.
-   */
-  setEntityColliderType(id: string, type: ColliderType): Collider | null {
-    const entity = this.entities.get(id);
-    if (!entity) return null;
-
-    const existing = this.colliderByEntity.get(id);
-    if (existing) {
-      this.physics.removeCollider(existing);
-      this.colliderByEntity.delete(id);
-      this.colliderTypeByEntity.delete(id);
+      collider.min.copy(box.min);
+      collider.max.copy(box.max);
     }
 
-    if (type === 'none') return null;
-
-    const box = new THREE.Box3().setFromObject(entity.object3D);
-    let collider: Collider;
-    if (type === 'box') {
-      const [min, max] = this.worldAABBOf(entity.object3D);
-      collider = this.physics.addStaticCollider(min, max);
-    } else if (type === 'sphere') {
-      const center = box.getCenter(new THREE.Vector3());
-      const radius = box.getSize(new THREE.Vector3()).length() / 2;
-      collider = this.physics.addSphereCollider(center, radius);
-    } else {
-      const size = box.getSize(new THREE.Vector3());
-      const radius = Math.max(size.x, size.z) / 2;
-      const height = Math.max(0.01, size.y - radius * 2);
-      collider = this.physics.addCapsuleCollider({ x: box.min.x + radius, y: box.min.y, z: box.min.z + radius }, height, radius);
+    // Box3D gibi ofset-tabanlı component'ler entity dünya konumuna göre
+    // konumlanır — entity taşındığında bu component'lerin de yeniden
+    // senkronize edilmesi gerekir (aksi halde eski collider konumda "hayalet"
+    // bir çarpışma hacmi kalır).
+    for (const component of entity.components) {
+      const def = this.componentTypes.get(component.typeId);
+      def?.onSync(entity, component.data, this);
     }
-
-    this.colliderByEntity.set(id, collider);
-    this.colliderTypeByEntity.set(id, type);
-    entity.colliderId = id;
-    return collider;
-  }
-
-  getColliderForEntity(id: string): Collider | undefined {
-    return this.colliderByEntity.get(id);
-  }
-
-  getColliderTypeForEntity(id: string): ColliderType {
-    return this.colliderTypeByEntity.get(id) ?? 'none';
-  }
-
-  // ------------------------- Character Controller kaydı -------------------------
-  // Inspector'daki "Rigidbody/Config Verileri" (mass/radius/height/maxForce/friction)
-  // bir entity'ye BAĞLI bir CharacterController örneğini canlı besler.
-
-  attachCharacterController(id: string, config: CharacterControllerConfig): CharacterController {
-    const existing = this.controllerByEntity.get(id);
-    if (existing) return existing;
-    const controller = this.physics.createCharacterController(config);
-    this.controllerByEntity.set(id, controller);
-    return controller;
-  }
-
-  getCharacterController(id: string): CharacterController | undefined {
-    return this.controllerByEntity.get(id);
-  }
-
-  /** Inspector'daki sayısal alanlar değiştikçe çağrılır - CharacterController.setConfig'e iletir. */
-  updateCharacterControllerConfig(id: string, patch: Partial<CharacterControllerConfig>) {
-    this.controllerByEntity.get(id)?.setConfig(patch);
-  }
-
-  detachCharacterController(id: string) {
-    this.controllerByEntity.delete(id);
   }
 
   removeEntity(id: string) {
     const entity = this.entities.get(id);
     if (!entity) return;
+
+    // Component'leri entity yok edilmeden ÖNCE detach et — aksi halde
+    // Box3D'nin collider'ı veya CameraSystem3D'nin aktif-kamera referansı
+    // sahne temizlendikten sonra sahipsiz (dangling) kalır.
+    for (const component of [...entity.components]) {
+      const def = this.componentTypes.get(component.typeId);
+      def?.onDetach?.(entity, component.data, this);
+    }
+
     this.scene.remove(entity.object3D);
     entity.object3D.traverse((child) => {
       const mesh = child as THREE.Mesh;
@@ -255,16 +242,7 @@ export class Engine {
         for (const m of mats) m?.dispose();
       }
     });
-
-    // [FIX - MEMORY LEAK] Collider'ı fiziksel dünyadan da kaldır - önceki
-    // sürümde bu satır YOKTU, silinen nesnelerin collider'ları sonsuza kadar
-    // Octree'de kalıp "hayalet duvar" oluşturuyordu.
-    const collider = this.colliderByEntity.get(id);
-    if (collider) this.physics.removeCollider(collider);
     this.colliderByEntity.delete(id);
-    this.colliderTypeByEntity.delete(id);
-    this.controllerByEntity.delete(id);
-
     this.entities.delete(id);
   }
 
@@ -274,17 +252,45 @@ export class Engine {
       formatVersion: 1,
       name: sceneName,
       entities: [...this.entities.values()].map((e) => ({
-        id: e.id, name: e.name, transform: e.transform, userData: e.userData,
+        id: e.id,
+        name: e.name,
+        transform: e.transform,
+        userData: e.userData,
+        hasCollider: e.colliderId !== undefined,
+        components: e.components.map((c) => ({ typeId: c.typeId, data: { ...c.data } })),
       })),
     };
   }
 
-  /** Bir JSON sahnesini yükler. `registerEntityKind` ile tanımlı factory'ler kullanılır. */
+  /**
+   * Bir JSON sahnesini yükler. `registerEntityKind`/`registerComponentType`
+   * ile tanımlı factory'ler ve component türleri kullanılır.
+   *
+   * BUG FIX (kaydet→yükle döngüsünü kıran bir hataydı): önceden `hasCollider`
+   * hiç serileştirilmiyordu ve `deserialize()`, `createEntity()`'i HER ZAMAN
+   * `solidCollider=false` ile çağırıyordu — yani bir sahneyi kaydedip tekrar
+   * yüklemek, TÜM "solid" duvarların çarpışmasını SESSİZCE kaybediyordu.
+   * Component'ler de aynı şekilde önceden hiç geri yüklenmiyordu.
+   */
   deserialize(data: SerializedScene) {
     for (const id of [...this.entities.keys()]) this.removeEntity(id);
     for (const se of data.entities) {
       const kind = String(se.userData.__kind ?? 'unknown');
-      this.createEntity(kind, se.name, se.transform, se.userData);
+      if (!this.factories.has(kind)) {
+        // Bilinmeyen tür (ör. oyunun bildiği ama editörün/bu Engine örneğinin
+        // registerEntityKind ile hiç tanımlamadığı bir tür) — createEntity()
+        // bunun için throw eder; TÜM sahne yüklemesini iptal etmek yerine
+        // sadece bu entity'yi atla ve devam et.
+        continue;
+      }
+      const entity = this.createEntity(kind, se.name, se.transform, se.userData, se.hasCollider ?? false);
+      for (const c of se.components ?? []) {
+        const def = this.componentTypes.get(c.typeId);
+        if (!def) continue; // bilinmeyen component türü (ör. eski bir sürümden) — sessizce atla
+        const component: EngineComponent = { typeId: c.typeId, data: { ...def.defaultData(), ...c.data } };
+        entity.components.push(component);
+        def.onSync(entity, component.data, this);
+      }
     }
   }
 
@@ -293,4 +299,4 @@ export class Engine {
     this.render.dispose();
     this.assets.dispose();
   }
-}
+  }
