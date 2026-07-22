@@ -12,8 +12,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
-  Engine, MATERIAL_PRESETS, EditorGameBridge,
-  type EntityTransform, type EngineEntity, type SerializedScene,
+  Engine, MATERIAL_PRESETS, EditorGameBridge, BUILTIN_COMPONENT_TYPES,
+  type EntityTransform, type EngineEntity, type SerializedScene, type ComponentTypeDefinition,
 } from '@game-engine/core';
 
 export type ShaderPreset = keyof typeof MATERIAL_PRESETS; // 'wall' | 'metal' | 'plastic'
@@ -59,6 +59,7 @@ export class EditorViewport {
   constructor() {
     this.engine = new Engine();
     this.registerEntityKinds();
+    for (const def of BUILTIN_COMPONENT_TYPES) this.engine.registerComponentType(def);
   }
 
   mount(container: HTMLElement) {
@@ -375,12 +376,97 @@ export class EditorViewport {
   }
 
   private loadSceneFromGame(scene: SerializedScene) {
-    for (const se of scene.entities) {
-      const kind = String(se.userData.__kind ?? 'box');
-      if (!['box', 'spawnPoint', 'bombsite', 'light', 'model'].includes(kind)) continue;
-      this.engine.createEntity(kind, se.name, se.transform, se.userData, Boolean((se.userData as EditorEntityUserData).solid));
-    }
+    // BUG FIX: önceden bu metot `engine.createEntity()`'i her entity için
+    // TEK TEK, MEVCUT sahneyi hiç temizlemeden çağırıyordu — "Oyundan
+    // Sahneyi Çek" iki kez tıklanırsa (veya editörde zaten elle nesne
+    // eklenmişken tıklanırsa) TÜM entity'ler DUPLICATE oluyordu.
+    // `engine.deserialize()` zaten (a) önce sahneyi temizler, (b) hasCollider
+    // ve component'leri de doğru şekilde geri yükler — onu kullanmak hem
+    // bu hatayı çözer hem kod tekrarını kaldırır.
+    this.engine.deserialize(scene);
+    this.select(null);
     this.onSceneChange?.();
+  }
+
+  /** Bir JSON dosyasından (daha önce dışa aktarılmış) sahneyi yükler — mevcut sahnenin YERİNE geçer. */
+  loadSceneFromJSON(scene: SerializedScene) {
+    this.engine.deserialize(scene);
+    this.select(null);
+    this.onSceneChange?.();
+  }
+
+  // ------------------------------------------------------------- COMPONENTS --
+
+  getComponentTypeDefs(): ComponentTypeDefinition<any>[] {
+    return this.engine.getComponentTypeDefs();
+  }
+
+  addComponentToSelected(typeId: string) {
+    if (!this.selectedId) return;
+    this.engine.addComponent(this.selectedId, typeId);
+    this.onSceneChange?.();
+  }
+
+  removeComponentFromSelected(typeId: string) {
+    if (!this.selectedId) return;
+    this.engine.removeComponent(this.selectedId, typeId);
+    this.onSceneChange?.();
+  }
+
+  updateSelectedComponentData(typeId: string, patch: Record<string, unknown>) {
+    if (!this.selectedId) return;
+    this.engine.updateComponentData(this.selectedId, typeId, patch);
+    this.onSceneChange?.();
+  }
+
+  // ------------------------------------------------------------- SAVE/LOAD --
+
+  private static readonly AUTOSAVE_KEY = 'sahne-editoru-autosave-v1';
+
+  /**
+   * Her sahne değişikliğinde (debounce'lu — App.tsx bunu bir zamanlayıcıyla
+   * çağırır) sahneyi tarayıcının localStorage'ına yazar. Bu "gerçek" dosya
+   * kaydı DEĞİLDİR (bkz. exportScene/loadSceneFromJSON — asıl kalıcı format
+   * budur), ama sekme kazara kapanırsa/tarayıcı çökerse kurtarma sağlar —
+   * gerçek editörlerin "otomatik kaydet" davranışına karşılık gelir.
+   */
+  autosaveToLocalStorage() {
+    try {
+      const json = JSON.stringify(this.exportScene());
+      window.localStorage.setItem(EditorViewport.AUTOSAVE_KEY, json);
+    } catch {
+      // localStorage dolu/erişilemez olabilir — otomatik kayıt sessizce atlanır,
+      // kullanıcının asıl "Kaydet (JSON)" akışını ENGELLEMEMELİ.
+    }
+  }
+
+  /** Daha önce autosaveToLocalStorage() ile kaydedilmiş bir oturum var mı? */
+  hasAutosavedSession(): boolean {
+    try {
+      return window.localStorage.getItem(EditorViewport.AUTOSAVE_KEY) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  restoreAutosavedSession(): boolean {
+    try {
+      const raw = window.localStorage.getItem(EditorViewport.AUTOSAVE_KEY);
+      if (!raw) return false;
+      const scene = JSON.parse(raw) as SerializedScene;
+      this.loadSceneFromJSON(scene);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  discardAutosavedSession() {
+    try {
+      window.localStorage.removeItem(EditorViewport.AUTOSAVE_KEY);
+    } catch {
+      // yoksayılabilir
+    }
   }
 
   private pushLiveUpdateForSelected() {
@@ -393,4 +479,4 @@ export class EditorViewport {
   exportScene() {
     return this.engine.serialize('Editör Sahnesi');
   }
-}
+  }
