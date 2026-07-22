@@ -1,7 +1,7 @@
 // src/App.tsx
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { EditorViewport, type EditorEntityUserData, type ShaderPreset } from './EditorViewport';
-import type { EngineEntity } from '@game-engine/core';
+import type { EngineEntity, ComponentTypeDefinition, SerializedScene } from '@game-engine/core';
 import type { AssetRecord } from '@game-engine/core/assets';
 
 const BRIDGE_URL = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_BRIDGE_URL ?? 'ws://localhost:8787';
@@ -20,13 +20,23 @@ export function App() {
   const [mode, setMode] = useState<'translate' | 'rotate' | 'scale'>('translate');
   const [status, setStatus] = useState('Hazır.');
   const [bridgeConnected, setBridgeConnected] = useState(false);
+  const [componentTypes, setComponentTypes] = useState<ComponentTypeDefinition<any>[]>([]);
 
   const modelInputRef = useRef<HTMLInputElement>(null);
   const textureInputRef = useRef<HTMLInputElement>(null);
+  const sceneInputRef = useRef<HTMLInputElement>(null);
 
   const refreshEntities = useCallback(() => {
-    setEntities(editorRef.current?.engine.listEntities() ?? []);
-  }, []);
+    const editor = editorRef.current;
+    setEntities(editor?.engine.listEntities() ?? []);
+    // Seçili entity'nin referansı `updateSelectedUserData`/component güncellemeleri
+    // sonrası değişmiş olabilir (bkz. EditorViewport — bazı güncellemeler entity'yi
+    // yeniden yaratır) — Inspector'ın güncel veriyi göstermesi için yeniden okunuyor.
+    if (editor && selected) {
+      const fresh = editor.engine.getEntity(selected.id);
+      setSelected(fresh ?? null);
+    }
+  }, [selected]);
 
   useEffect(() => {
     const editor = new EditorViewport();
@@ -36,6 +46,28 @@ export function App() {
     editor.onSelectionChange = (e) => setSelected(e);
     editor.onSceneChange = () => refreshEntities();
     refreshEntities();
+    setComponentTypes(editor.getComponentTypeDefs());
+
+    // Otomatik-kaydedilmiş bir oturum varsa kullanıcıya sor.
+    if (editor.hasAutosavedSession()) {
+      const restore = window.confirm('Kaydedilmemiş bir önceki oturum bulundu. Geri yüklensin mi?');
+      if (restore) {
+        editor.restoreAutosavedSession();
+        setStatus('Önceki oturum geri yüklendi.');
+      } else {
+        editor.discardAutosavedSession();
+      }
+    }
+
+    // Debounce'lu otomatik kaydetme: her sahne değişikliğinden 1.5 sn sonra
+    // (art arda gelen değişiklikleri TEK bir yazma işlemine toplamak için).
+    let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleAutosave = () => {
+      if (autosaveTimer) clearTimeout(autosaveTimer);
+      autosaveTimer = setTimeout(() => editor.autosaveToLocalStorage(), 1500);
+    };
+    const originalOnSceneChange = editor.onSceneChange;
+    editor.onSceneChange = () => { originalOnSceneChange?.(); scheduleAutosave(); };
 
     const bridge = editor.connectBridge(BRIDGE_URL);
     const checkInterval = setInterval(() => setBridgeConnected(bridge.isConnected()), 1000);
@@ -51,12 +83,14 @@ export function App() {
     window.addEventListener('keydown', onKeyDown);
 
     return () => {
+      if (autosaveTimer) clearTimeout(autosaveTimer);
       clearInterval(checkInterval);
       window.removeEventListener('keydown', onKeyDown);
       editor.unmount();
       editorRef.current = null;
     };
-  }, [refreshEntities]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- yalnızca mount/unmount'ta çalışmalı
+  }, []);
 
   const handleImportModel = async (file: File) => {
     setStatus(`İçe aktarılıyor: ${file.name}...`);
@@ -85,9 +119,23 @@ export function App() {
     const blob = new Blob([JSON.stringify(scene, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = 'sahne.json'; a.click();
+    a.href = url; a.download = `${scene.name || 'sahne'}.json`; a.click();
     URL.revokeObjectURL(url);
     setStatus('Sahne JSON olarak indirildi.');
+  };
+
+  const handleLoadSceneFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const scene = JSON.parse(text) as SerializedScene;
+      if (scene.formatVersion !== 1 || !Array.isArray(scene.entities)) {
+        throw new Error('Dosya geçerli bir sahne formatı değil (formatVersion/entities eksik).');
+      }
+      editorRef.current!.loadSceneFromJSON(scene);
+      setStatus(`Sahne yüklendi: ${file.name} (${scene.entities.length} nesne) — mevcut sahnenin YERİNE geçti.`);
+    } catch (err) {
+      setStatus(`Sahne yükleme hatası: ${(err as Error).message}`);
+    }
   };
 
   return (
@@ -123,7 +171,8 @@ export function App() {
         </div>
 
         <div className="divider" />
-        <button className="btn btn-ghost" onClick={handleExportJSON}>Kaydet (JSON)</button>
+        <button className="btn btn-ghost" onClick={handleExportJSON}>Kaydet (.json indir)</button>
+        <button className="btn btn-ghost" onClick={() => sceneInputRef.current?.click()}>Yükle (.json)</button>
         <button className="btn btn-ghost" onClick={() => editorRef.current?.requestSceneFromGame()}>Oyundan Sahneyi Çek</button>
         <div className="divider" />
         <button className="btn btn-danger" onClick={() => editorRef.current?.removeSelected()}>Seçiliyi Sil (Del)</button>
@@ -137,6 +186,8 @@ export function App() {
           onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleImportModel(f); e.target.value = ''; }} />
         <input ref={textureInputRef} type="file" accept="image/png,image/jpeg,image/webp" hidden
           onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleImportTexture(f); e.target.value = ''; }} />
+        <input ref={sceneInputRef} type="file" accept="application/json,.json" hidden
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleLoadSceneFile(f); e.target.value = ''; }} />
       </div>
 
       <div className="body">
@@ -162,7 +213,13 @@ export function App() {
         <div className="panel inspector">
           <div className="panel-header">Inspector</div>
           <div className="panel-content">
-            {!selected ? <div className="empty-hint">Bir nesne seç.</div> : <InspectorFields entity={selected} editor={editorRef.current!} />}
+            {!selected ? <div className="empty-hint">Bir nesne seç.</div> : (
+              <>
+                <InspectorFields entity={selected} editor={editorRef.current!} />
+                <hr />
+                <ComponentPanel entity={selected} editor={editorRef.current!} availableTypes={componentTypes} />
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -261,4 +318,4 @@ function InspectorFields({ entity, editor }: { entity: EngineEntity; editor: Edi
       {ud.__kind === 'model' && <div className="readonly-field">Asset: {ud.assetName}</div>}
     </div>
   );
-}
+                                                                                                 }
